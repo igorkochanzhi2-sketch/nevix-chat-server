@@ -1,0 +1,56 @@
+'use strict';
+/**
+ * start.js — запускатор сервера NEVIX Chat.
+ * Зачем нужен: телефон при скачивании переименовывает server.txt в «server (2).txt»,
+ * и Render не может найти файл по имени. Этот файл сам находит сервер и запускает его.
+ */
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const dir = __dirname;
+let files = [];
+try {
+  files = fs.readdirSync(dir);
+} catch (e) {
+  console.error('Не смог прочитать папку проекта: ' + e.message);
+  process.exit(1);
+}
+
+function looksLikeServer(name) {
+  if (!/\.(txt|js)$/i.test(name)) return false;
+  if (name === 'start.js') return false;
+  if (/^server/i.test(name)) return true;
+  try {
+    return fs.readFileSync(path.join(dir, name), 'utf8').indexOf('NEVIX Chat') > -1;
+  } catch (e) {
+    return false;
+  }
+}
+
+let cands = files.filter(looksLikeServer);
+if (!cands.length) {
+  console.error('Не нашёл файл сервера. Загрузи server.txt в репозиторий рядом с start.js.');
+  process.exit(1);
+}
+cands.sort((a, b) => {
+  // точное имя server.txt важнее всего, потом — самый свежий файл
+  const pa = /^server\.txt$/i.test(a) ? 0 : 1;
+  const pb = /^server\.txt$/i.test(b) ? 0 : 1;
+  if (pa !== pb) return pa - pb;
+  const ta = fs.statSync(path.join(dir, a)).mtimeMs;
+  const tb = fs.statSync(path.join(dir, b)).mtimeMs;
+  return tb - ta;
+});
+const file = cands[0];
+console.log('Запускаю ' + file + ' (найдено файлов сервера: ' + cands.length + ')');
+
+const child = spawn(process.execPath, [path.join(dir, file)], { stdio: 'inherit' });
+child.on('error', (e) => {
+  console.error('Не смог запустить: ' + e.message);
+  process.exit(1);
+});
+child.on('exit', (code, signal) => {
+  console.log('Сервер остановился: ' + (signal || code));
+  process.exit(code === null ? 1 : code);
+});
