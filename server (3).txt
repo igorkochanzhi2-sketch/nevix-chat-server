@@ -1,0 +1,1000 @@
+'use strict';
+/**
+ * NEVIX Chat — сервер.
+ * Что делает: аккаунты (хеш пароля scrypt), токены, чаты, сообщения,
+ * непрочитанные и серверный подсчёт серий NEXUS STREAK.
+ * Нужен только пакет pg (Postgres). Всё остальное — стандартная библиотека Node.
+ */
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+let WebSocketServer = null;
+try { WebSocketServer = require('ws').WebSocketServer; } catch (e) {
+  WebSocketServer = null;
+  console.warn('Пакет ws не установлен: живые сообщения и звонки будут недоступны');
+}
+
+const SESSION_DAYS = 90;
+const AWARDS = [
+  { at: 50, key: 'copper' },
+  { at: 100, key: 'gold' },
+  { at: 150, key: 'violet' },
+  { at: 200, key: 'neon' }
+];
+
+/* ─────────── пароли и токены ─────────── */
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 });
+  return 'scrypt$' + salt.toString('hex') + '$' + hash.toString('hex');
+}
+
+function checkPassword(password, stored) {
+  try {
+    const parts = String(stored).split('$');
+    if (parts.length !== 3) return false;
+    const salt = Buffer.from(parts[1], 'hex');
+    const hash = Buffer.from(parts[2], 'hex');
+    const test = crypto.scryptSync(password, salt, hash.length);
+    return crypto.timingSafeEqual(hash, test);
+  } catch (e) {
+    return false;
+  }
+}
+
+function newToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+function newId(prefix) {
+  return prefix + '_' + crypto.randomBytes(8).toString('hex');
+}
+
+// «Сегодня» по часовому поясу сервера серий (по умолчанию Москва, +3)
+const TZ_OFFSET = Number(process.env.STREAK_TZ_OFFSET || 3);
+function today() {
+  const now = new Date(Date.now() + TZ_OFFSET * 3600 * 1000);
+  return now.toISOString().slice(0, 10);
+}
+
+function dayDiff(a, b) {
+  return Math.round((Date.parse(a + 'T00:00:00Z') - Date.parse(b + 'T00:00:00Z')) / 86400000);
+}
+
+/* ─────────── схема (создаётся сама при старте) ─────────── */
+const SCHEMA = [
+  `create table if not exists users (
+     id text primary key,
+     lname text not null,
+     name text not null,
+     pass text not null,
+     username text,
+     about text,
+     hide_about integer not null default 0,
+     last_seen timestamptz,
+     banner text,
+     color text not null default '#ff3b3b',
+     photo text,
+     created timestamptz not null default now()
+   )`,
+  `create table if not exists tokens (
+     token text primary key,
+     user_id text not null,
+     created timestamptz not null default now()
+   )`,
+  `create table if not exists chats (
+     id text primary key,
+     kind text not null,
+     a text not null,
+     b text,
+     contact text,
+     created timestamptz not null default now()
+   )`,
+  `create table if not exists messages (
+     id text primary key,
+     chat text not null,
+     sender text not null,
+     body text not null,
+     kind text not null default 'text',
+     audio text,
+     photo text,
+     reply_id text,
+     reactions text not null default '',
+     seen boolean not null default false,
+     created timestamptz not null default now()
+   )`,
+  `create table if not exists streaks (
+     chat text primary key,
+     count integer not null default 0,
+     record integer not null default 0,
+     counted text,
+     day text,
+     mine boolean not null default false,
+     theirs boolean not null default false,
+     awards text not null default ''
+   )`,
+  `create table if not exists reads (
+     chat text not null,
+     user_id text not null,
+     seen_at timestamptz not null default now(),
+     primary key (chat, user_id)
+   )`
+];
+
+async function ensureSchema(pool) {
+  for (const sql of SCHEMA) await pool.query(sql);
+  // мягкие миграции для базы, созданной до 2.0
+  const fixes = [
+    'alter table users add column photo text',
+    "alter table messages add column kind text default 'text'",
+    'alter table messages add column audio text',
+    'alter table users add column username text',
+    'alter table users add column about text',
+    'alter table users add column banner text',
+    'alter table users add column hide_about integer default 0',
+    'alter table users add column last_seen timestamptz',
+    'alter table messages add column photo text',
+    'alter table messages add column reply_id text',
+    "alter table messages add column reactions text default ''"
+  ];
+  for (const sql of fixes) {
+    try { await pool.query(sql); } catch (e) { /* колонка уже есть */ }
+  }
+
+  // у старых пользователей нет @юзернейма — выдаём всем
+  try {
+    const old = await pool.query('select id, name from users where username is null');
+    for (const u of old.rows) {
+      const nick = await freeUsername(pool, baseUsername(u.name));
+      await pool.query('update users set username = $2 where id = $1', [u.id, nick]);
+    }
+  } catch (e) { console.warn('Не удалось выдать @юзернеймы:', e.message); }
+
+  try {
+    await pool.query('create unique index if not exists users_username_uniq on users (lower(username))');
+  } catch (e) { console.warn('Индекс @юзернеймов не создан:', e.message); }
+}
+
+/* ─────────── @юзернейм: цифры, английские буквы и _ , до 12 символов ─────────── */
+const USERNAME_RE = /^[a-z0-9_]{3,12}$/;
+
+function normUsername(v) {
+  return String(v || '').trim().replace(/^@+/, '').toLowerCase();
+}
+
+function usernameError(u) {
+  if (!u) return 'Введите @юзернейм';
+  if (u.length < 3) return '@юзернейм — минимум 3 символа';
+  if (u.length > 12) return '@юзернейм — максимум 12 символов';
+  if (!USERNAME_RE.test(u)) return 'В @юзернейме можно только цифры, английские буквы и _';
+  return null;
+}
+
+function baseUsername(name) {
+  const latin = String(name || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+  if (latin.length >= 3) return latin.slice(0, 12);
+  return 'user' + String(Math.floor(1000 + Math.random() * 9000));
+}
+
+async function freeUsername(pool, base) {
+  let nick = (base || 'user').slice(0, 12);
+  if (nick.length < 3) nick = (nick + 'user').slice(0, 12);
+  for (let i = 0; i < 50; i++) {
+    const r = await pool.query('select id from users where lower(username) = $1', [nick]);
+    if (!r.rows.length) return nick;
+    const tail = String(Math.floor(1 + Math.random() * 9999));
+    nick = (base || 'user').slice(0, 12 - tail.length) + tail;
+  }
+  return 'u' + Date.now().toString(36).slice(-6);
+}
+
+/* ─────────── демо-собеседники (для пустого состояния) ─────────── */
+const BOTS = [
+  { id: 'alex', name: 'Алекс', color: '#3f7d5a', online: true, about: 'в сети' },
+  { id: 'mira', name: 'Мира', color: '#8a5b9e', online: false, about: 'был(а) недавно' },
+  { id: 'code', name: 'Кодер', color: '#2f6f9e', online: true, about: 'в сети' },
+  { id: 'team', name: 'Команда', color: '#b4762f', online: true, about: 'в сети' },
+  { id: 'max', name: 'Макс', color: '#9e4b4b', online: false, about: 'был(а) в 21:40' }
+];
+
+const BOT_ANSWERS = [
+  'Понял тебя 🙂',
+  'Ок, давай так',
+  'Интересно! Расскажи подробнее',
+  'Согласен 👍',
+  'Это демо-ответ сервера, а не живой человек',
+  'Ага, ясно'
+];
+
+function botAnswer() {
+  return BOT_ANSWERS[Math.floor(Math.random() * BOT_ANSWERS.length)];
+}
+
+// краткая инфа о сообщении, на которое отвечают
+function replyJson(rows, replyId, myId) {
+  const src = rows.find((x) => x.id === replyId);
+  if (!src) return null;
+  const kind = src.kind || 'text';
+  const text = kind === 'photo' ? 'Фото' : (kind === 'voice' ? 'Голосовое сообщение' : src.body);
+  return {
+    id: src.id,
+    me: src.sender === myId,
+    text: String(text || '').slice(0, 120)
+  };
+}
+
+/* ─────────── серии ─────────── */
+async function getStreak(pool, chatId) {
+  const r = await pool.query('select * from streaks where chat = $1', [chatId]);
+  if (r.rows.length) return r.rows[0];
+  await pool.query('insert into streaks (chat) values ($1)', [chatId]);
+  return { chat: chatId, count: 0, record: 0, counted: null, day: null, mine: false, theirs: false, awards: '' };
+}
+
+// who: 'mine' — написал владелец чата, 'theirs' — собеседник
+async function markStreak(pool, chatId, who) {
+  const st = await getStreak(pool, chatId);
+  const t = today();
+  let count = Number(st.count) || 0;
+  let mine = !!st.mine;
+  let theirs = !!st.theirs;
+  let day = st.day;
+  let counted = st.counted;
+  let record = Number(st.record) || 0;
+  let awards = st.awards || '';
+
+  if (day !== t) {
+    if (day && dayDiff(t, day) > 1) count = 0; // пропустили день — серия обрывается
+    mine = false;
+    theirs = false;
+    day = t;
+  }
+
+  if (who === 'mine') mine = true;
+  else theirs = true;
+
+  let fresh = false;
+  if (mine && theirs && counted !== t) {
+    count += 1;
+    counted = t;
+    fresh = true;
+    if (count > record) record = count;
+    const got = awards ? awards.split(',') : [];
+    AWARDS.forEach((x) => { if (count >= x.at && got.indexOf(x.key) === -1) got.push(x.key); });
+    awards = got.join(',');
+  }
+
+  await pool.query(
+    'update streaks set count = $2, record = $3, counted = $4, day = $5, mine = $6, theirs = $7, awards = $8 where chat = $1',
+    [chatId, count, record, counted, day, mine, theirs, awards]
+  );
+
+  return { count, record, awards: awards ? awards.split(',') : [], mine, theirs, day, fresh };
+}
+
+/* ─────────── разбор запросов ─────────── */
+function json(res, code, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+    'access-control-allow-headers': 'content-type, authorization',
+    'access-control-allow-methods': 'GET, POST, OPTIONS'
+  });
+  res.end(body);
+}
+
+function readBody(req, limit) {
+  const max = limit || 4.5 * 1024 * 1024;   // фото и голосовые приходят как base64
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    let tooBig = false;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > max) { tooBig = true; chunks.length = 0; return; }  // дочитываем и отвечаем по-человечески
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (tooBig) {
+        const e = new Error('Файл слишком большой');
+        e.code = 'TOO_BIG';
+        return reject(e);
+      }
+      if (!chunks.length) return resolve({});
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch (e) { reject(new Error('не разобрал JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+async function auth(pool, req) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+  if (!token) return null;
+  const r = await pool.query('select * from tokens where token = $1', [token]);
+  if (!r.rows.length) return null;
+  const u = await pool.query('select * from users where id = $1', [r.rows[0].user_id]);
+  if (!u.rows.length) return null;
+  return u.rows[0];
+}
+
+function userJson(u) {
+  return { id: u.id, name: u.name, username: u.username || null, color: u.color, photo: u.photo || null };
+}
+
+/* ─────────── чат в вид, удобный приложению ─────────── */
+function hmMsk(ts) {
+  if (!ts) return null;
+  const off = Number(process.env.STREAK_TZ_OFFSET || 3);
+  const d = new Date(new Date(ts).getTime() + off * 3600000);
+  return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+}
+
+async function chatJson(pool, chat, me, isOnline) {
+  const st = await getStreak(pool, chat.id);
+  const lastR = await pool.query(
+    'select * from messages where chat = $1 order by created desc, id desc limit 1',
+    [chat.id]
+  );
+  const readR = await pool.query('select seen_at from reads where chat = $1 and user_id = $2', [chat.id, me.id]);
+  const readAt = readR.rows.length ? readR.rows[0].seen_at : null;
+  const unreadR = readAt
+    ? await pool.query('select count(*) as c from messages where chat = $1 and sender <> $2 and created > $3', [chat.id, me.id, readAt])
+    : await pool.query('select count(*) as c from messages where chat = $1 and sender <> $2', [chat.id, me.id]);
+
+  let title = 'Чат';
+  let color = '#3f7d5a';
+  let photo = null;
+  let username = null;
+  let banner = null;
+  let online = false;
+  let about = 'был(а) недавно';
+  let peerId = null;
+
+  if (chat.kind === 'bot') {
+    const bot = BOTS.find((b) => b.id === chat.contact) || BOTS[0];
+    title = bot.name;
+    color = bot.color;
+    online = bot.online;
+    about = bot.about;
+  } else {
+    peerId = chat.a === me.id ? chat.b : chat.a;
+    const p = await pool.query('select * from users where id = $1', [peerId]);
+    if (p.rows.length) {
+      title = p.rows[0].name;
+      color = p.rows[0].color;
+      photo = p.rows[0].photo || null;
+      username = p.rows[0].username || null;
+      online = isOnline ? !!isOnline(peerId) : false;
+      const own = (p.rows[0].hide_about ? '' : (p.rows[0].about || '')).trim();
+      if (online) about = own || 'в сети';
+      else {
+        const t = hmMsk(p.rows[0].last_seen);
+        about = t ? 'был(а) в ' + t : 'был(а) недавно';
+      }
+      banner = p.rows[0].banner || null;
+    }
+  }
+
+  const last = lastR.rows.length
+    ? { text: lastR.rows[0].body, me: lastR.rows[0].sender === me.id, time: lastR.rows[0].created }
+    : null;
+
+  return {
+    id: chat.id,
+    kind: chat.kind,
+    title,
+    color,
+    photo,
+    username,
+    banner,
+    online,
+    about,
+    peerId,
+    unread: Number(unreadR.rows[0].c) || 0,
+    last,
+    streak: {
+      count: Number(st.count) || 0,
+      record: Number(st.record) || 0,
+      awards: st.awards ? st.awards.split(',') : [],
+      mine: !!st.mine,
+      theirs: !!st.theirs,
+      day: st.day
+    }
+  };
+}
+
+async function chatById(pool, id) {
+  const r = await pool.query('select * from chats where id = $1', [id]);
+  return r.rows[0] || null;
+}
+
+function member(chat, userId) {
+  return chat.a === userId || chat.b === userId;
+}
+
+/* ─────────── приложение ─────────── */
+// Ищем HTML приложения: сначала index.html, иначе любой .html в папке.
+// Так сервер не зависит от того, как браузер назвал файл при скачивании.
+function findAppFile(dir) {
+  try {
+    const names = fs.readdirSync(dir);
+    if (names.indexOf('index.html') > -1) return 'index.html';
+    const html = names.filter((n) => /\.html?$/i.test(n));
+    if (html.length) return html[0];
+  } catch (e) {}
+  return 'index.html';
+}
+
+function createServer(options) {
+  const pool = options.pool;
+  const publicDir = options.publicDir || __dirname;
+  const appFile = findAppFile(publicDir);
+
+  /* ── WebSocket: живые сообщения, «печатает…», звонки ── */
+  const sockets = new Map(); // userId -> Set<ws>
+
+  function broadcast(userId, payload) {
+    const set = sockets.get(userId);
+    if (!set) return;
+    const data = JSON.stringify(payload);
+    set.forEach((ws) => { try { ws.send(data); } catch (e) {} });
+  }
+
+  function isOnline(userId) {
+    const set = sockets.get(userId);
+    return !!(set && set.size);
+  }
+
+  async function touchSeen(userId) {
+    try { await pool.query('update users set last_seen = now() where id = $1', [userId]); } catch (e) {}
+  }
+
+  async function wsAuth(token) {
+    if (!token) return null;
+    const r = await pool.query('select * from tokens where token = $1', [token]);
+    if (!r.rows.length) return null;
+    const u = await pool.query('select * from users where id = $1', [r.rows[0].user_id]);
+    return u.rows[0] || null;
+  }
+
+  function attachWs(server) {
+    if (!WebSocketServer) return null;
+    const wss = new WebSocketServer({ server, path: '/ws' });
+
+    wss.on('connection', async (ws, req) => {
+      const url = new URL(req.url, 'http://localhost');
+      const user = await wsAuth(url.searchParams.get('token'));
+      if (!user) { try { ws.close(); } catch (e) {} return; }
+
+      if (!sockets.has(user.id)) sockets.set(user.id, new Set());
+      sockets.get(user.id).add(ws);
+      await touchSeen(user.id);
+      broadcast(user.id, { type: 'ready' });
+
+      ws.on('message', async (raw) => {
+        let m = null;
+        try { m = JSON.parse(String(raw)); } catch (e) { return; }
+        if (!m || !m.type) return;
+
+        // «печатает…» и «прочитано» пересылаем собеседнику
+        if (m.type === 'typing' || m.type === 'read') {
+          if (!m.chatId) return;
+          const chat = await chatById(pool, m.chatId);
+          if (!chat || !member(chat, user.id)) return;
+          const peer = chat.a === user.id ? chat.b : chat.a;
+          if (peer) broadcast(peer, { type: m.type, chatId: m.chatId });
+          return;
+        }
+
+        // сигналинг звонков: offer / answer / ice / end / reject
+        if (m.type.indexOf('call-') === 0) {
+          if (!m.to) return;
+          broadcast(m.to, Object.assign({}, m, { from: user.id, fromName: user.name }));
+        }
+      });
+
+      ws.on('close', () => {
+        const set = sockets.get(user.id);
+        if (set) {
+          set.delete(ws);
+          if (!set.size) {
+            sockets.delete(user.id);
+            touchSeen(user.id);
+          }
+        }
+      });
+    });
+
+    return wss;
+  }
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    const p = url.pathname.replace(/\/+$/, '') || '/';
+
+    if (req.method === 'OPTIONS') return json(res, 204, {});
+
+    try {
+      /* --- служебное --- */
+      if (p === '/api/health') return json(res, 200, { ok: true, time: new Date().toISOString() });
+
+      /* --- регистрация и вход --- */
+      if (p === '/api/auth/signup' && req.method === 'POST') {
+        const body = await readBody(req);
+        const name = String(body.name || '').trim();
+        const password = String(body.password || '');
+        if (name.length < 2) return json(res, 400, { error: 'Имя — минимум 2 символа' });
+        if (name.length > 24) return json(res, 400, { error: 'Имя — максимум 24 символа' });
+        if (password.length < 6) return json(res, 400, { error: 'Пароль — минимум 6 символов' });
+
+        const lname = name.toLowerCase();
+        const busy = await pool.query('select id from users where lname = $1', [lname]);
+        if (busy.rows.length) return json(res, 409, { error: 'Такое имя уже занято' });
+
+        const colors = ['#3f7d5a', '#8a5b9e', '#2f6f9e', '#b4762f', '#9e4b4b', '#ff3b3b'];
+
+        // @юзернейм: если не прислали — придумываем сами
+        let username = normUsername(body.username);
+        if (username) {
+          const bad = usernameError(username);
+          if (bad) return json(res, 400, { error: bad });
+          const busy = await pool.query('select id from users where lower(username) = $1', [username]);
+          if (busy.rows.length) return json(res, 409, { error: 'Такой @юзернейм уже занят' });
+        } else {
+          username = await freeUsername(pool, baseUsername(name));
+        }
+
+        const user = {
+          id: newId('u'),
+          lname,
+          name,
+          username,
+          pass: hashPassword(password),
+          color: colors[Math.floor(Math.random() * colors.length)]
+        };
+        await pool.query('insert into users (id, lname, name, pass, username, color) values ($1,$2,$3,$4,$5,$6)',
+          [user.id, user.lname, user.name, user.pass, user.username, user.color]);
+
+        const token = newToken();
+        await pool.query('insert into tokens (token, user_id) values ($1,$2)', [token, user.id]);
+        return json(res, 201, { token, user: userJson(user) });
+      }
+
+      if (p === '/api/auth/login' && req.method === 'POST') {
+        const body = await readBody(req);
+        const name = String(body.name || '').trim().toLowerCase();
+        const password = String(body.password || '');
+        const r = await pool.query('select * from users where lname = $1', [name]);
+        if (!r.rows.length || !checkPassword(password, r.rows[0].pass)) {
+          return json(res, 401, { error: 'Неверное имя или пароль' });
+        }
+        const token = newToken();
+        await pool.query('insert into tokens (token, user_id) values ($1,$2)', [token, r.rows[0].id]);
+        return json(res, 200, { token, user: userJson(r.rows[0]) });
+      }
+
+      if (p === '/api/auth/logout' && req.method === 'POST') {
+        const h = req.headers.authorization || '';
+        const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+        if (token) await pool.query('delete from tokens where token = $1', [token]);
+        return json(res, 200, { ok: true });
+      }
+
+      /* --- дальше всё требует токен --- */
+      const me = await auth(pool, req);
+
+      if (p === '/api/me' && req.method === 'GET') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const numR = await pool.query('select count(*) as c from users where created < $1', [me.created]);
+        return json(res, 200, {
+          user: userJson(me),
+          about: me.about || '',
+          hideAbout: !!me.hide_about,
+          banner: me.banner || null,
+          created: me.created,
+          index: (Number(numR.rows[0].c) || 0) + 1,
+          total: Number((await pool.query('select count(*) as c from users')).rows[0].c) || 0
+        });
+      }
+
+      /* сменить имя и цвет */
+      if (p === '/api/me' && req.method === 'POST') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const body = await readBody(req);
+        const name = String(body.name || me.name).trim();
+        if (name.length < 2) return json(res, 400, { error: 'Имя — минимум 2 символа' });
+        const color = String(body.color || me.color);
+        const photo = body.photo === null ? null : (body.photo || me.photo || null);
+        const about = body.about === undefined ? (me.about || '') : String(body.about || '').slice(0, 140);
+        const hideAbout = body.hideAbout === undefined ? (me.hide_about ? 1 : 0) : (body.hideAbout ? 1 : 0);
+        const banner = body.banner === undefined ? (me.banner || null) : (body.banner === null ? null : String(body.banner).slice(0, 24));
+        const lname = name.toLowerCase();
+        const busy = await pool.query('select id from users where lname = $1 and id <> $2', [lname, me.id]);
+        if (busy.rows.length) return json(res, 409, { error: 'Такое имя уже занято' });
+
+        let username = me.username;
+        if (body.username !== undefined && body.username !== null) {
+          const nick = normUsername(body.username);
+          if (nick && nick !== String(me.username || '')) {
+            const bad = usernameError(nick);
+            if (bad) return json(res, 400, { error: bad });
+            const taken = await pool.query('select id from users where lower(username) = $1 and id <> $2', [nick, me.id]);
+            if (taken.rows.length) return json(res, 409, { error: 'Такой @юзернейм уже занят' });
+            username = nick;
+          }
+        }
+        await pool.query('update users set name = $2, lname = $3, color = $4, photo = $5, username = $6, about = $7, banner = $8, hide_about = $9 where id = $1',
+          [me.id, name, lname, color, photo, username, about, banner, hideAbout]);
+        return json(res, 200, { user: { id: me.id, name, username, color, photo, about, banner, hideAbout: !!hideAbout } });
+      }
+
+      /* смена пароля */
+      if (p === '/api/auth/password' && req.method === 'POST') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const body = await readBody(req);
+        const oldPass = String(body.oldPassword || '');
+        const newPass = String(body.newPassword || '');
+        if (newPass.length < 6) return json(res, 400, { error: 'Новый пароль — минимум 6 символов' });
+        if (!checkPassword(oldPass, me.pass)) return json(res, 400, { error: 'Текущий пароль неверный' });
+        await pool.query('update users set pass = $2 where id = $1', [me.id, hashPassword(newPass)]);
+        return json(res, 200, { ok: true });
+      }
+
+      /* удалить аккаунт со всеми чатами */
+      if (p === '/api/auth/delete' && req.method === 'POST') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const mine = await pool.query('select * from chats where a = $1 or b = $1', [me.id]);
+        for (const c of mine.rows) {
+          await pool.query('delete from messages where chat = $1', [c.id]);
+          await pool.query('delete from streaks where chat = $1', [c.id]);
+          await pool.query('delete from reads where chat = $1', [c.id]);
+          await pool.query('delete from chats where id = $1', [c.id]);
+        }
+        await pool.query('delete from tokens where user_id = $1', [me.id]);
+        await pool.query('delete from users where id = $1', [me.id]);
+        return json(res, 200, { ok: true });
+      }
+
+      if (p === '/api/contacts' && req.method === 'GET') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const r = await pool.query('select id, name, username, color, photo from users where id <> $1 order by name', [me.id]);
+        return json(res, 200, { bots: BOTS, users: r.rows });
+      }
+
+      if (p === '/api/chats' && req.method === 'GET') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const r = await pool.query('select * from chats where a = $1 or b = $1 order by created asc', [me.id]);
+        const out = [];
+        for (const c of r.rows) out.push(await chatJson(pool, c, me, isOnline));
+        return json(res, 200, { chats: out });
+      }
+
+      /* создать чат: с живым человеком по имени или с демо-собеседником */
+      if (p === '/api/chats' && req.method === 'POST') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const body = await readBody(req);
+
+        if (body.contactId) {
+          const bot = BOTS.find((b) => b.id === body.contactId);
+          if (!bot) return json(res, 404, { error: 'Нет такого собеседника' });
+          const id = 'bot:' + me.id + ':' + bot.id;
+          let chat = await chatById(pool, id);
+          if (!chat) {
+            await pool.query('insert into chats (id, kind, a, contact) values ($1,$2,$3,$4)',
+              [id, 'bot', me.id, bot.id]);
+            chat = await chatById(pool, id);
+          }
+          return json(res, 200, { chat: await chatJson(pool, chat, me, isOnline) });
+        }
+
+        const peerNick = normUsername(body.username);
+        let peerR;
+        if (peerNick) {
+          const bad = usernameError(peerNick);
+          if (bad) return json(res, 400, { error: bad });
+          peerR = await pool.query('select * from users where lower(username) = $1', [peerNick]);
+          if (!peerR.rows.length) return json(res, 404, { error: 'Такого @юзернейма нет' });
+        } else {
+          // старый путь по имени — оставлен на случай кэша браузера
+          const peerName = String(body.peerName || '').trim().toLowerCase();
+          if (peerName.length < 2) return json(res, 400, { error: 'Введите @юзернейм' });
+          peerR = await pool.query('select * from users where lname = $1', [peerName]);
+          if (!peerR.rows.length) return json(res, 404, { error: 'Человек с таким именем не зарегистрирован' });
+        }
+        const peer = peerR.rows[0];
+        if (peer.id === me.id) return json(res, 400, { error: 'Это вы' });
+
+        const pair = [me.id, peer.id].sort();
+        const id = 'd:' + pair[0] + ':' + pair[1];
+        let chat = await chatById(pool, id);
+        if (!chat) {
+          await pool.query('insert into chats (id, kind, a, b) values ($1,$2,$3,$4)',
+            [id, 'direct', pair[0], pair[1]]);
+          chat = await chatById(pool, id);
+        }
+        return json(res, 200, { chat: await chatJson(pool, chat, me, isOnline) });
+      }
+
+      /* сообщения чата */
+      const msgMatch = p.match(/^\/api\/chats\/([^/]+)\/messages$/);
+      if (msgMatch) {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const chatId = decodeURIComponent(msgMatch[1]);
+        const chat = await chatById(pool, chatId);
+        if (!chat || !member(chat, me.id)) return json(res, 404, { error: 'Нет такого чата' });
+
+        if (req.method === 'GET') {
+          const since = url.searchParams.get('since');
+          const r = since
+            ? await pool.query('select * from messages where chat = $1 and created > $2 order by created asc', [chatId, since])
+            : await pool.query('select * from messages where chat = $1 order by created asc', [chatId]);
+          return json(res, 200, {
+            messages: r.rows.map((m, i) => ({
+              id: m.id,
+              text: m.body,
+              kind: m.kind || 'text',
+              audio: m.audio || null,
+              photo: m.photo || null,
+              reactions: m.reactions || '',
+              replyTo: m.reply_id ? replyJson(r.rows, m.reply_id, me.id) : null,
+              me: m.sender === me.id,
+              time: m.created,
+              seen: !!m.seen
+            }))
+          });
+        }
+
+        if (req.method === 'POST') {
+          const body = await readBody(req);
+          const kindRaw = String(body.kind || 'text');
+          const kind = kindRaw === 'voice' ? 'voice' : (kindRaw === 'photo' ? 'photo' : 'text');
+          const photo = kind === 'photo' ? String(body.photo || '') : null;
+          const text = String(body.text || (kind === 'voice' ? 'Голосовое сообщение' : (kind === 'photo' ? 'Фото' : ''))).trim();
+          const audio = kind === 'voice' ? String(body.audio || '') : null;
+          const replyId = body.replyId ? String(body.replyId) : null;
+
+          if (kind === 'photo') {
+            if (!photo || photo.length < 100) return json(res, 400, { error: 'Фото не прикрепилось' });
+            if (photo.length > 3 * 1024 * 1024) return json(res, 413, { error: 'Фото слишком большое' });
+          }
+          if (kind === 'text' && !text) return json(res, 400, { error: 'Пустое сообщение' });
+          if (text.length > 4000) return json(res, 400, { error: 'Слишком длинное сообщение' });
+          if (kind === 'voice') {
+            if (!audio || audio.length < 100) return json(res, 400, { error: 'Голосовое не записалось' });
+            if (audio.length > 3.5 * 1024 * 1024) return json(res, 413, { error: 'Голосовое слишком длинное' });
+          }
+
+          const id = newId('m');
+          await pool.query('insert into messages (id, chat, sender, body, kind, audio, photo, reply_id) values ($1,$2,$3,$4,$5,$6,$7,$8)',
+            [id, chatId, me.id, text, kind, audio, photo, replyId]);
+          // в личном чате «своя» сторона — та, что записана в chat.a
+          const side = chat.kind === 'direct' ? (me.id === chat.a ? 'mine' : 'theirs') : 'mine';
+          const streak = await markStreak(pool, chatId, side);
+
+          if (chat.kind === 'bot') {
+            const peer = BOTS.find((b) => b.id === chat.contact) || BOTS[0];
+            setTimeout(async () => {
+              try {
+                const answer = botAnswer();
+                await pool.query('insert into messages (id, chat, sender, body) values ($1,$2,$3,$4)',
+                  [newId('m'), chatId, 'bot:' + peer.id, answer]);
+                await markStreak(pool, chatId, 'theirs');
+              } catch (e) { /* сервер мог уснуть — это нормально для демо */ }
+            }, 1200);
+          }
+
+          const r = await pool.query('select * from messages where id = $1', [id]);
+          let replyTo = null;
+          if (replyId) {
+            const rr = await pool.query('select * from messages where id = $1', [replyId]);
+            if (rr.rows.length) replyTo = replyJson(rr.rows, replyId, me.id);
+          }
+          const saved = {
+            id,
+            text,
+            kind,
+            audio,
+            photo,
+            reactions: '',
+            replyTo,
+            me: true,
+            time: r.rows[0].created,
+            seen: false
+          };
+          // мгновенно отправляем собеседникам
+          const peers = await pool.query('select a, b from chats where id = $1', [chatId]);
+          if (peers.rows.length) {
+            const row = peers.rows[0];
+            [row.a, row.b].forEach((uid) => {
+              if (uid && uid !== me.id) broadcast(uid, { type: 'message', chatId, message: saved, streak });
+            });
+          }
+          return json(res, 201, { message: saved, streak });
+        }
+      }
+
+      /* поставить или убрать реакцию */
+      const reactMatch = p.match(/^\/api\/chats\/([^/]+)\/messages\/([^/]+)\/react$/);
+      if (reactMatch && req.method === 'POST') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const chatId = decodeURIComponent(reactMatch[1]);
+        const msgId = decodeURIComponent(reactMatch[2]);
+        const chat = await chatById(pool, chatId);
+        if (!chat || !member(chat, me.id)) return json(res, 404, { error: 'Нет такого чата' });
+        const body = await readBody(req);
+        const emoji = String(body.emoji || '').slice(0, 4);
+        if (!emoji) return json(res, 400, { error: 'Нет смайлика' });
+        const r = await pool.query('select * from messages where id = $1 and chat = $2', [msgId, chatId]);
+        if (!r.rows.length) return json(res, 404, { error: 'Сообщение уже удалено' });
+
+        // формат хранения: "❤️:u1,u2|🔥:u3"
+        let map = [];
+        try { map = String(r.rows[0].reactions || '').split('|').filter(Boolean).map((chunk) => {
+          const i = chunk.indexOf(':');
+          return { emoji: chunk.slice(0, i), users: chunk.slice(i + 1).split(',').filter(Boolean) };
+        }); } catch (e) { map = []; }
+
+        const same = map.find((x) => x.emoji === emoji);
+        if (same) {
+          if (same.users.indexOf(me.id) > -1) same.users = same.users.filter((u) => u !== me.id);
+          else same.users.push(me.id);
+        } else {
+          map.push({ emoji, users: [me.id] });
+        }
+        map = map.filter((x) => x.users.length);
+        const stored = map.map((x) => x.emoji + ':' + x.users.join(',')).join('|');
+        await pool.query('update messages set reactions = $2 where id = $1', [msgId, stored]);
+
+        const payload = { type: 'reaction', chatId, messageId: msgId, reactions: stored };
+        [chat.a, chat.b].forEach((uid) => { if (uid) broadcast(uid, payload); });
+        return json(res, 200, { reactions: stored });
+      }
+
+      /* удалить своё сообщение */
+      const delMsg = p.match(/^\/api\/chats\/([^/]+)\/messages\/([^/]+)$/);
+      if (delMsg && req.method === 'DELETE') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const chatId = decodeURIComponent(delMsg[1]);
+        const msgId = decodeURIComponent(delMsg[2]);
+        const chat = await chatById(pool, chatId);
+        if (!chat || !member(chat, me.id)) return json(res, 404, { error: 'Нет такого чата' });
+        const r = await pool.query('select * from messages where id = $1 and chat = $2', [msgId, chatId]);
+        if (!r.rows.length) return json(res, 404, { error: 'Сообщение уже удалено' });
+        if (r.rows[0].sender !== me.id) return json(res, 403, { error: 'Можно удалять только свои сообщения' });
+        await pool.query('delete from messages where id = $1', [msgId]);
+        [chat.a, chat.b].forEach((uid) => {
+          if (uid) broadcast(uid, { type: 'message-deleted', chatId, messageId: msgId });
+        });
+        return json(res, 200, { ok: true });
+      }
+
+      /* удалить чат у всех */
+      if (req.method === 'DELETE' && /^\/api\/chats\/[^/]+$/.test(p)) {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const chatId = decodeURIComponent(p.split('/')[3]);
+        const chat = await chatById(pool, chatId);
+        if (!chat || !member(chat, me.id)) return json(res, 404, { error: 'Нет такого чата' });
+        await pool.query('delete from messages where chat = $1', [chatId]);
+        await pool.query('delete from streaks where chat = $1', [chatId]);
+        await pool.query('delete from reads where chat = $1', [chatId]);
+        await pool.query('delete from chats where id = $1', [chatId]);
+        [chat.a, chat.b].forEach((uid) => {
+          if (uid) broadcast(uid, { type: 'chat-deleted', chatId });
+        });
+        return json(res, 200, { ok: true });
+      }
+
+      /* настройки для звонков (STUN + TURN, если есть ключ) */
+      if (p === '/api/ice' && req.method === 'GET') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+        const key = process.env.METERED_KEY;
+        if (key) {
+          try {
+            const r = await fetch('https://nevix-chat.metered.live/api/v1/turn/credentials?apiKey=' + encodeURIComponent(key));
+            if (r.ok) {
+              const list = await r.json();
+              if (Array.isArray(list)) list.forEach((x) => servers.push(x));
+            }
+          } catch (e) { /* останется только STUN */ }
+        }
+        return json(res, 200, { iceServers: servers, turn: !!key });
+      }
+
+      /* отметка «прочитано» */
+      const readMatch = p.match(/^\/api\/chats\/([^/]+)\/read$/);
+      if (readMatch && req.method === 'POST') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const chatId = decodeURIComponent(readMatch[1]);
+        const chat = await chatById(pool, chatId);
+        if (!chat || !member(chat, me.id)) return json(res, 404, { error: 'Нет такого чата' });
+        const now = new Date().toISOString();
+        await pool.query('delete from reads where chat = $1 and user_id = $2', [chatId, me.id]);
+        await pool.query('insert into reads (chat, user_id, seen_at) values ($1,$2,$3)', [chatId, me.id, now]);
+        return json(res, 200, { ok: true });
+      }
+
+      /* серия */
+      const stMatch = p.match(/^\/api\/chats\/([^/]+)\/streak$/);
+      if (stMatch && req.method === 'GET') {
+        if (!me) return json(res, 401, { error: 'Нужен вход' });
+        const chatId = decodeURIComponent(stMatch[1]);
+        const chat = await chatById(pool, chatId);
+        if (!chat || !member(chat, me.id)) return json(res, 404, { error: 'Нет такого чата' });
+        const st = await getStreak(pool, chatId);
+        return json(res, 200, {
+          streak: {
+            count: Number(st.count) || 0,
+            record: Number(st.record) || 0,
+            awards: st.awards ? st.awards.split(',') : []
+          }
+        });
+      }
+
+      if (p.startsWith('/api/')) return json(res, 404, { error: 'Нет такого адреса' });
+
+      /* --- статика: само приложение --- */
+      let file = path.join(publicDir, p === '/' ? appFile : p.replace(/^\/+/, ''));
+      if (!file.startsWith(publicDir)) file = path.join(publicDir, appFile);
+      fs.readFile(file, (err, data) => {
+        if (err) {
+          fs.readFile(path.join(publicDir, appFile), (e2, html) => {
+            if (e2) { res.writeHead(404); return res.end('Не найдено'); }
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+            res.end(html);
+          });
+          return;
+        }
+        const ext = path.extname(file);
+        const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.ico': 'image/x-icon', '.png': 'image/png', '.svg': 'image/svg+xml' };
+        res.writeHead(200, { 'content-type': types[ext] || 'application/octet-stream' });
+        res.end(data);
+      });
+    } catch (e) {
+      if (e && e.code === 'TOO_BIG') return json(res, 413, { error: 'Файл слишком большой — попробуйте фото поменьше' });
+      json(res, 500, { error: 'Ошибка сервера: ' + e.message });
+    }
+  });
+
+  const wss = attachWs(server);
+  server.ensureSchema = () => ensureSchema(pool);
+  server.broadcast = broadcast;
+  server.wss = wss;
+  return server;
+}
+
+/* ─────────── запуск ─────────── */
+if (require.main === module) {
+  const { Pool } = require('pg');
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    console.error('Нет переменной DATABASE_URL — не к чему подключаться.');
+    process.exit(1);
+  }
+  const pool = new Pool({
+    connectionString,
+    ssl: connectionString.includes('sslmode=disable') ? false : { rejectUnauthorized: false },
+    max: 5
+  });
+
+  const server = createServer({ pool });
+
+  server.ensureSchema()
+    .then(() => {
+      const port = process.env.PORT || 3000;
+      server.listen(port, '0.0.0.0', () => {
+        console.log('NEVIX Chat сервер слушает порт ' + port);
+      });
+    })
+    .catch((e) => {
+      console.error('Не смог создать таблицы: ' + e.message);
+      process.exit(1);
+    });
+}
+
+module.exports = { createServer, ensureSchema, hashPassword, checkPassword, markStreak, today };
